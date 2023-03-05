@@ -76,7 +76,7 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
 #                                 we need to chech the correct account repo for this from: 
 #                                 https://docs.aws.amazon.com/eks/latest/userguide/add-ons-images.html
 
-# create ingress controller
+# create ingress controller class
 kubectl apply -f ./manifests/lb
 
 
@@ -118,9 +118,28 @@ aws route53 change-resource-record-sets \
 aws acm wait certificate-validated --certificate-arn $certificate_arn
 
 
-# create internet facing ingress for further use 
+# create a policy that will allow external-dns pod to add, remove DNS entries (Record Sets in a Hosted Zone) in AWS Route53 service
+export ext_dns_policy_arn=$(aws iam create-policy --policy-name AllowExternalDNSUpdates --policy-document file://helper_files/AllowExternalDNSUpdates.json | jq -r '.Policy.Arn')
+eksctl create iamserviceaccount \
+  --cluster=${cluster_name} \
+  --namespace=default \
+  --name=external-dns \
+  --attach-policy-arn=${ext_dns_policy_arn} \
+  --override-existing-serviceaccounts \
+  --approve
+
+# add the external dns management deployment, with the relevant permissions
+external_dns_role_arn_tmp=$(kubectl describe sa external-dns | grep -i Annotations:)
+prefix="Annotations:         eks.amazonaws.com/role-arn: "
+export external_dns_role_arn=${external_dns_role_arn_tmp#"$prefix"}
+export external_dns_role_arn_escaped="${external_dns_role_arn//\//\\/}"
+sed "s/eks.amazonaws.com\/role-arn: /eks.amazonaws.com\/role-arn: ${external_dns_role_arn_escaped}/g" manifests/external-dns/external-dns.template > manifests/external-dns/external-dns-${cluster_name}.yaml
+kubectl apply -f ./manifests/external-dns/external-dns-${cluster_name}.yaml
+
+
+# create internet facing ingress (with ssl-redirect and external dns support) for further use 
 export certificate_arn_escaped="${certificate_arn//\//\\/}"
 sed "s/alb.ingress.kubernetes.io\/certificate-arn: /alb.ingress.kubernetes.io\/certificate-arn: ${certificate_arn_escaped}/g" manifests/ingress/alb-ingress.template > manifests/ingress/alb-ingress-${cluster_name}.yaml
-
-
+sed -i '' "s/external-dns.alpha.kubernetes.io\/hostname: /external-dns.alpha.kubernetes.io\/hostname: example1.${domain_name}, example2.${domain_name}/g" manifests/ingress/alb-ingress-${cluster_name}.yaml
+kubectl apply -f ./manifests/ingress/alb-ingress-${cluster_name}.yaml
 
