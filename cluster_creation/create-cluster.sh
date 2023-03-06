@@ -29,6 +29,9 @@ eksctl create nodegroup --cluster=${cluster_name} \
                         --alb-ingress-access \
                         --node-private-networking       
 
+# get the vpc id for several uses
+export vpc_id=$(aws ec2 describe-vpcs --filter Name=tag:Name,Values=eksctl-${cluster_name}-cluster/VPC | jq -r '.Vpcs[].VpcId') 
+
 # Create an OIDC provider and IAM role for the AWS Load Balancer Controller
 eksctl utils associate-iam-oidc-provider \
     --region ${aws_region} \
@@ -61,7 +64,6 @@ mv iam_policy_* .tmp/
 
 # Install the AWS Load Balancer Controller using Helm 3.0.0
 kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller//crds?ref=master"
-export vpc_id=$(aws ec2 describe-vpcs --filter Name=tag:Name,Values=eksctl-${cluster_name}-cluster/VPC | jq -r '.Vpcs[].VpcId') 
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
@@ -115,6 +117,7 @@ aws route53 change-resource-record-sets \
   }
   '
 
+# wait for the certificate to be ready
 aws acm wait certificate-validated --certificate-arn $certificate_arn
 
 
@@ -143,3 +146,64 @@ sed "s/alb.ingress.kubernetes.io\/certificate-arn: /alb.ingress.kubernetes.io\/c
 sed -i '' "s/external-dns.alpha.kubernetes.io\/hostname: /external-dns.alpha.kubernetes.io\/hostname: example1.${domain_name}, example2.${domain_name}/g" manifests/ingress/alb-ingress-${cluster_name}.yaml
 kubectl apply -f ./manifests/ingress/alb-ingress-${cluster_name}.yaml
 
+
+# create RDS in private subnet
+# 1. find the vpc id
+# 2. create a security group "Allow access for RDS Database on port 3306" (Name: eks_rds_db_sg) in our vpc
+#   2.1 Type: MYSQL/Aurora
+#   2.2 Proto: TCP
+#   2.3 Port:  3306
+#   2.4 Source: Anywhere
+# 3. find the private subnets
+# 4. Create DB subnet group
+# 5. Free tier
+# 6. DBName: usermgmtdb
+# 7. User/Pass: dbadmin/dbpassword11
+export rds_db_name="usermgmtdb"
+export rds_db_instance_sz="db.t3.micro"
+export rds_db_engine="mysql"
+export rds_db_useradmin="dbadmin"
+export rds_db_passadmin="dbpassword11"
+export rds_db_alloc_storage=20
+export rds_db_az="${aws_region}a"
+
+# security group for rds
+export rds_vpc_sec_gr=$(aws ec2 create-security-group \
+                          --group-name eks_rds_db_sg \
+                          --description "Allow access for RDS Database on port 3306" \
+                          --vpc-id ${vpc_id} \
+                          | jq -r '.GroupId')
+retval=$(aws ec2 authorize-security-group-ingress \
+    --group-id ${rds_vpc_sec_gr} \
+    --protocol tcp \
+    --port 3306 \
+    --cidr 0.0.0.0/0 | jq -r '.Return')
+if [[ $retval != true ]]; 
+then 
+  echo "Could not add rule to policy for RDS creation" 
+  return
+fi
+aws ec2 authorize-security-group-ingress \
+    --group-id ${rds_vpc_sec_gr} --protocol tcp --port 3306
+
+# subnet group for rds
+export vpc_private_subnet_ids=$(aws ec2 describe-subnets --filter Name=vpc-id,Values=${vpc_id} --query 'Subnets[?MapPublicIpOnLaunch==`false`].SubnetId')
+export rds_db_subnet=$(aws rds create-db-subnet-group \
+    --db-subnet-group-name rds_subnet \
+    --db-subnet-group-description "RDS subnet group" \
+    --subnet-ids ${vpc_private_subnet_ids} | jq -r '.DBSubnetGroup.DBSubnetGroupName')
+
+# actual creation of the rds
+aws rds create-db-instance \
+    --db-instance-identifier ${rds_db_name} \
+    --db-instance-class ${rds_db_instance_sz} \
+    --engine ${rds_db_engine} \
+    --availability-zone ${rds_db_az} \
+    --db-subnet-group-name ${rds_db_subnet} \
+    --vpc-security-group-ids ${rds_vpc_sec_gr} \
+    --master-username ${rds_db_useradmin} \
+    --master-user-password ${rds_db_passadmin} \
+    --allocated-storage ${rds_db_alloc_storage}
+
+# wait for the rds to become available
+aws rds wait db-instance-available --db-instance-identifier=usermgmtdb
