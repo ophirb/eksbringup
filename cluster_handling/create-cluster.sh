@@ -2,7 +2,10 @@ export account_number=281138344795
 export cluster_name=urithiru
 export aws_region=us-east-1
 export domain_name=simplecluster.com
+export execution_folder=~/repos/eksbringup/cluster_handling
 
+
+cd ${execution_folder}
 
 #create the cluster
 eksctl create cluster --name=${cluster_name} \
@@ -79,17 +82,16 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
 #                                 https://docs.aws.amazon.com/eks/latest/userguide/add-ons-images.html
 
 # create ingress controller class
-kubectl apply -f ./manifests/lb
+kubectl apply -f  ./manifests/lb --recursive
 
-
-# create certificate 
+# create domain certificate 
 export certificate_arn=$(aws acm request-certificate \
 --domain-name   "*.${domain_name}" \
 --validation-method DNS | jq -r '.CertificateArn')
 
 sleep 10 
 
-# register the certificate arn in route53
+# register the domain certificate arn in route53
 export CNAME_name=$(aws acm describe-certificate --certificate-arn $certificate_arn | jq -r '.Certificate.DomainValidationOptions[].ResourceRecord.Name')
 export CNAME_value=$(aws acm describe-certificate --certificate-arn $certificate_arn | jq -r '.Certificate.DomainValidationOptions[].ResourceRecord.Value')
 
@@ -115,9 +117,9 @@ aws route53 change-resource-record-sets \
       }
     }]
   }
-  '
+  ' | jq '.'
 
-# wait for the certificate to be ready
+# wait for the domain certificate to be ready
 aws acm wait certificate-validated --certificate-arn $certificate_arn
 
 
@@ -184,7 +186,7 @@ then
   return
 fi
 aws ec2 authorize-security-group-ingress \
-    --group-id ${rds_vpc_sec_gr} --protocol tcp --port 3306
+    --group-id ${rds_vpc_sec_gr} --protocol tcp --port 3306 | jq '.'
 
 # subnet group for rds
 export vpc_private_subnet_ids=$(aws ec2 describe-subnets --filter Name=vpc-id,Values=${vpc_id} --query 'Subnets[?MapPublicIpOnLaunch==`false`].SubnetId')
@@ -203,7 +205,16 @@ aws rds create-db-instance \
     --vpc-security-group-ids ${rds_vpc_sec_gr} \
     --master-username ${rds_db_useradmin} \
     --master-user-password ${rds_db_passadmin} \
-    --allocated-storage ${rds_db_alloc_storage}
+    --allocated-storage ${rds_db_alloc_storage} | jq '.'
 
 # wait for the rds to become available
 aws rds wait db-instance-available --db-instance-identifier=usermgmtdb
+
+# create a secret for the db (dbpassword11)
+kubectl apply -f ./manifests/rds/secrets.yaml
+
+# create an external name for the rds
+export rds_endpoint=$(aws rds describe-db-instances --db-instance-identifier usermgmtdb | jq -r '.DBInstances[].Endpoint.Address')
+sed "s/externalName: /externalName: ${rds_endpoint}/g" manifests/rds/external-name.template > manifests/rds/external-name-${cluster_name}.yaml
+kubectl apply -f manifests/rds/external-name-${cluster_name}.yaml
+
